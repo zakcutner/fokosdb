@@ -1,0 +1,21 @@
+apps/fokos-svc/package.json
+  s_9e07e10ad76eef::t_b6e8c99cd786bc 6-38,41,53-58,71
+apps/fokos-svc/package-lock.json
+  s_9e07e10ad76eef::t_643d99ee66639c 10-13,25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f17b7944d25c1b419fbb7532a0148d88d3a8922c",
+  "prompts": {},
+  "sessions": {
+    "s_9e07e10ad76eef": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fa7861e68ffezCNVjM4Ov4jKf1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Zak Cutner <zak@cloudflare.com>"
+    }
+  }
+}
