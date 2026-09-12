@@ -76,6 +76,14 @@ When a PartitionDO's SQLite size exceeds `hashSplitConditions.maxSizeMb`, it que
 
 **Critical**: `splitN` must NOT change after initialization — it would break routing and cause data loss.
 
+## queryItems paging
+
+`queryItems` returns one bounded page per call. `select` is `"projection"` (complete items, the default) or `"count"` (`items: []` and the matched count of the page). A caller follows `cursor` until it is absent; a page can hold zero items and still carry a cursor.
+
+Four budgets bound a page, and `shared/query/page-budget.ts` holds their values: the evaluated-item budget (`limit`, default 1,000, maximum 100,000), a fixed evaluated-byte budget over the stored `est_row_bytes` of the evaluated items, the response-byte budget (`maxResponseBytes`) over the materialized items, and the partition-visit budget. `QueryPageBudget` tracks them across sub-queries in `FokosDB` and across children in `walkRangeChildren`; both pass the remaining values and `allowOversizedFirstItem` down in every RPC. The first materialized item of a page can exceed the response budget once, for the whole page and not once per leaf.
+
+The leaf scan is `PartitionStore.scanQueryPage` plus `shared/query/query-collector.ts`. Count mode reads only `sk` and `est_row_bytes` from the covering `idx_items_scan` index. The statement binds `LIMIT remainingEvaluatedItems + 1`: the extra row tells a stopped page from a drained interval. A candidate that a budget rejects stops the page with an inclusive `nextCursor` at that candidate and is not counted; a range router that exhausts a budget resumes exclusively after `lastEvaluatedCursor`. `meta.rowsRead` and `meta.rowsReturned` are physical SQLite metrics and are never derived from `count` or `scannedCount`. Migration keeps `collectBatch` and its own byte budget; do not merge the two collectors.
+
 ## Transaction Protocol (2PC)
 
 Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USENIX ATC 2023 paper (Idziorek et al.)](https://www.usenix.org/system/files/atc23-idziorek.pdf) and the [_Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service_ USENIX ATC 2022 paper (Elhemali et al.)](https://www.usenix.org/system/files/atc22-elhemali.pdf).

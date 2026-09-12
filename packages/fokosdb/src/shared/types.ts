@@ -220,16 +220,25 @@ export interface ItemQuerier {
 	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
 }
 
+/** The selection of a queryItems page: materialized items, or the matched count only. */
+export type QuerySelect = "projection" | "count";
+
 // The field names what the list contains: `queries` here, `items` on the two transaction methods.
 export type QueryItemsOptions = {
 	queries: Array<{ hashKey: string | Uint8Array; sortKeyCondition?: SortKeyCondition; scanIndexForward?: boolean }>;
+	/** Evaluated items per page. Defaults to DEFAULT_EVALUATED_ITEMS_PER_PAGE, clamped to MAX_EVALUATED_ITEMS_PER_PAGE. */
 	limit?: number;
-	maxPageBytes?: number;
+	/** Materialized item bytes per page. Defaults to DEFAULT_RESPONSE_BYTES_PER_PAGE, clamped to MAX_RESPONSE_BYTES_PER_PAGE. */
+	maxResponseBytes?: number;
 	cursor?: string;
+	/** Defaults to "projection". "count" returns `items: []` and the matched count of one page. */
+	select?: QuerySelect;
 };
 
 export type QueryItemsMeta = {
+	/** Physical SQLite rows read by the leaf query statements. */
 	rowsRead: number;
+	/** SQL result rows the leaf collectors consumed in JavaScript. */
 	rowsReturned: number;
 	forwardCount: number;
 	partitionsVisited: number;
@@ -248,7 +257,10 @@ export type QueryItemsResult = {
 		ttlAt?: number;
 		version: number;
 	}>;
+	/** Matched items in this page. */
 	count: number;
+	/** Evaluated items in this page. Equal to `count` until filters exist. */
+	scannedCount: number;
 	cursor?: string;
 	meta: QueryItemsMeta;
 	partitionMetas: Array<OperationMetrics & PartitionInfo>;

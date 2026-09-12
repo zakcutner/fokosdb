@@ -1,6 +1,6 @@
 # RFC — `queryItems` count and projection selection
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-11
 
 ## Table of contents

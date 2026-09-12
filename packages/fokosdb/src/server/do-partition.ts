@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, OperationMetrics, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
+import { DataKind, OperationMetrics, type QuerySelect, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
 import type { CompiledConditionPlan } from "../shared/expression/plan.js";
 import type {
 	CancelRequest,
@@ -77,7 +77,8 @@ import {
 	rangeIntersects,
 	type SkInterval,
 } from "../shared/query/sk-interval.js";
-import { PageBudget } from "../shared/query/page-budget.js";
+import { QueryPageBudget } from "../shared/query/page-budget.js";
+import { collectQueryPage } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { applyImageCap, conditionFailedReason, decodeItemKeys, IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
@@ -163,21 +164,32 @@ export type QueryItemsRpcRequest = {
 	hashKey: KeyBytes;
 	interval: SkInterval;
 	direction: "asc" | "desc";
-	budgetBytes: number;
-	remainingLimit: number | null;
-	/**
-	 * Max number of leaf partitions this request may scan before stopping and returning a
-	 * continuation cursor. Bounds the cross-DO subrequest fan-out of a single page over a
-	 * heavily-split (or sparse) range subtree. Decremented as the walk descends.
-	 */
-	maxPartitionVisits: number;
+	remainingEvaluatedItems: number;
+	remainingEvaluatedBytes: number;
+	remainingResponseBytes: number;
+	/** Leaf partitions this request may still visit before it stops with a boundary cursor. Bounds the cross-DO fan-out of one page. */
+	remainingPartitionVisits: number;
+	/** True until any leaf of the page materialized an item. Lets the first item of a page exceed the response budget. */
+	allowOversizedFirstItem: boolean;
 	cursor: ScanCursor | null;
+	select: QuerySelect;
 };
 
 export type QueryItemsRpcResponse = {
 	items: MigratedItem[];
+	/** Matched items in this response. */
+	count: number;
+	/** Evaluated items in this response. */
+	scannedCount: number;
+	/** Stored bytes of the evaluated items, charged to the evaluated-byte budget. */
+	evaluatedBytes: number;
+	/** Estimated RPC bytes of the materialized items, charged to the response-byte budget. */
+	responseBytes: number;
+	/** SQL result rows that the leaf scans consumed in JavaScript. */
+	rowsReturned: number;
+	/** The last candidate that entered the logical page, or null when none did. */
+	lastEvaluatedCursor: ScanCursor | null;
 	nextCursor: ScanCursor | null;
-	bytesConsumed: number;
 	/**
 	 * The serving DO's own bookkeeping record (servedBy*, hashDepth) — NOT part of the public
 	 * partitionMetas. Its `forwardCount` is subtree-cumulative: withSplitForwarding adds 1 per hash hop,
@@ -705,50 +717,40 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
 		const hk = req.hashKey;
-		const { interval, cursor, budgetBytes, remainingLimit } = req;
+		const { interval, cursor } = req;
 
 		const lower = interval.lower?.value ?? KeyCodec.encodeOptional(undefined);
 		const lowerInclusive = interval.lower?.inclusive ?? true;
 		const upper = interval.upper?.value ?? null;
 		const upperInclusive = interval.upper?.inclusive ?? false;
 
-		let rowsScanned = 0;
-		const PAGE_SIZE = 20;
-
-		const {
-			rows,
-			nextCursor,
-			totalBytes: bytesConsumed,
-		} = collectBatch<MigratedItem, ScanCursor>({
-			fetchPage: (pageCursor, pageSize) => {
-				const page = this.#store.queryRangeItemsPage({
-					hk,
-					lower,
-					lowerInclusive,
-					upper,
-					upperInclusive,
-					cursor: pageCursor,
-					limit: pageSize,
-					direction: req.direction,
-					decodeJson: true, // public read: json rows decode to JSON text; db.ts parses at the boundary.
-				});
-				rowsScanned += page.length;
-				return page;
-			},
-			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
-			estimateBytes: estimateItemBytes,
-			budgetBytes,
-			maxItems: remainingLimit ?? undefined,
-			pageSize: PAGE_SIZE,
-			startCursor: cursor,
+		const scan = this.#store.scanQueryPage({
+			hk,
+			lower,
+			lowerInclusive,
+			upper,
+			upperInclusive,
+			cursor,
+			direction: req.direction,
+			// One row beyond the budget tells a stopped page from a drained interval.
+			limit: Math.max(0, req.remainingEvaluatedItems) + 1,
+			select: req.select,
 		});
+		const page = collectQueryPage({
+			rows: scan.rows,
+			hashKey: hk,
+			select: req.select,
+			budget: req,
+			estimateResponseBytes: estimateItemBytes,
+		});
+		const { rowsRead, rowsWritten } = scan.sqlMetrics();
 
 		// A leaf (hash leaf or non-split range partition) is the only kind of DO that scans rows, so it
 		// is the only kind that contributes a `partitionMetas` entry. Routers (hash or range) are
 		// excluded — they appear only numerically via `forwardCount`.
 		const meta: OperationMetrics & PartitionInfoInternal = {
-			rowsRead: rowsScanned,
-			rowsWritten: 0,
+			rowsRead,
+			rowsWritten,
 			databaseSize: this.#store.databaseSize,
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
@@ -761,7 +763,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			},
 		};
 
-		return { items: rows, nextCursor, bytesConsumed, meta, partitionMetas: [meta] };
+		return {
+			items: page.items,
+			count: page.count,
+			scannedCount: page.scannedCount,
+			evaluatedBytes: page.evaluatedBytes,
+			responseBytes: page.responseBytes,
+			rowsReturned: page.rowsReturned,
+			lastEvaluatedCursor: page.lastEvaluatedCursor,
+			nextCursor: page.nextCursor,
+			meta,
+			partitionMetas: [meta],
+		};
 	}
 
 	private async queryItemsAsRangeNode(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
@@ -781,14 +794,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		req: QueryItemsRpcRequest,
 	): Promise<QueryItemsRpcResponse> {
 		const { interval, cursor, direction } = req;
-		const budget = new PageBudget(req.budgetBytes, req.remainingLimit, req.maxPartitionVisits);
+		const budget = new QueryPageBudget(req);
 
 		const allItems: MigratedItem[] = [];
 		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
 		// contribute nothing of their own; they're captured numerically via `forwardCount`.
 		const leafMetas: Array<OperationMetrics & PartitionInfoInternal> = [];
 		let nextCursor: ScanCursor | null = null;
-		let totalBytesConsumed = 0;
+		let count = 0;
+		let scannedCount = 0;
+		let evaluatedBytes = 0;
+		let responseBytes = 0;
+		let rowsReturned = 0;
+		let lastEvaluatedCursor: ScanCursor | null = null;
 		let childrenCalled = 0;
 		// Sum of forwards performed by descendant routers, so this node's `forwardCount` is cumulative.
 		let descendantForwards = 0;
@@ -824,30 +842,42 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const childResult = await childStub.apiQueryItems(childCtx, {
 				...req,
 				interval: clippedInterval,
-				budgetBytes: budget.remainingBytes,
-				remainingLimit: budget.remainingLimit,
-				maxPartitionVisits: budget.remainingVisits,
+				remainingEvaluatedItems: budget.remainingEvaluatedItems,
+				remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
+				remainingResponseBytes: budget.remainingResponseBytes,
+				remainingPartitionVisits: budget.remainingPartitionVisits,
+				allowOversizedFirstItem: budget.allowOversizedFirstItem,
 				cursor: childCursor,
 			});
 
-			allItems.push(...childResult.items);
+			if (req.select === "projection") {
+				allItems.push(...childResult.items);
+			}
 			leafMetas.push(...childResult.partitionMetas);
 			descendantForwards += childResult.meta.forwardCount;
-			totalBytesConsumed += childResult.bytesConsumed;
-			budget.consume(childResult.bytesConsumed, childResult.items.length, childResult.partitionMetas.length);
+			count += childResult.count;
+			scannedCount += childResult.scannedCount;
+			evaluatedBytes += childResult.evaluatedBytes;
+			responseBytes += childResult.responseBytes;
+			rowsReturned += childResult.rowsReturned;
+			lastEvaluatedCursor = childResult.lastEvaluatedCursor ?? lastEvaluatedCursor;
+			budget.consume(childResult);
 			childrenCalled++;
 
 			if (childResult.nextCursor !== null) {
 				nextCursor = childResult.nextCursor;
 				break;
 			}
+			// The child drained as a shared budget reached zero: resume strictly after the last
+			// evaluated candidate (a leaf cursor carries no `inclusive` flag).
 			if (budget.budgetExhausted) {
-				const lastItem = allItems[allItems.length - 1];
-				if (hasLaterCandidate && lastItem) nextCursor = { hk: lastItem.hk, sk: lastItem.sk };
+				if (hasLaterCandidate && lastEvaluatedCursor) nextCursor = lastEvaluatedCursor;
 				break;
 			}
 			if (budget.visitsExhausted && hasLaterCandidate) {
-				console.warn(`fokos/partition.walkRangeChildren: maxPartitionVisits reached (${req.maxPartitionVisits}), emitting boundary cursor`);
+				console.warn(
+					`fokos/partition.walkRangeChildren: remainingPartitionVisits reached (${req.remainingPartitionVisits}), emitting boundary cursor`,
+				);
 				nextCursor = makeBoundaryCursor(req.hashKey, childStart, childEnd, direction);
 				break;
 			}
@@ -871,7 +901,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			},
 		};
 
-		return { items: allItems, nextCursor, bytesConsumed: totalBytesConsumed, meta, partitionMetas: leafMetas };
+		return {
+			items: allItems,
+			count,
+			scannedCount,
+			evaluatedBytes,
+			responseBytes,
+			rowsReturned,
+			lastEvaluatedCursor,
+			nextCursor,
+			meta,
+			partitionMetas: leafMetas,
+		};
 	}
 
 	////////////////////////

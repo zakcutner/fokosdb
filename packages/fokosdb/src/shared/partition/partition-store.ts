@@ -1,5 +1,5 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { DATA_KINDS, type DataKind } from "../types.js";
+import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
 import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
@@ -139,6 +139,20 @@ export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction
 
 export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
+/** The bounds of one sort-key range scan of the items table under a single hash key. */
+export type RangeScanBounds = {
+	hk: KeyBytes;
+	lower: KeyBytes;
+	lowerInclusive: boolean;
+	upper: KeyBytes | null;
+	upperInclusive: boolean;
+	cursor: ScanCursor | null;
+	direction: "asc" | "desc";
+};
+
+/** One row of a queryItems leaf scan. Count rows carry `item: null`. */
+export type QueryScanRow = { sk: KeyBytes; estRowBytes: number; item: MigratedItem | null };
+
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
 export type PromotedKeyStatus = "queued" | "promoting" | "promoted";
@@ -202,6 +216,61 @@ export function fromSqlData(value: string | ArrayBuffer | null): string | Uint8A
 export function fromSqlData(value: string | ArrayBuffer | null): string | Uint8Array | null {
 	if (value === null) return null;
 	return typeof value === "string" ? value : new Uint8Array(value);
+}
+
+/** The `WHERE` conditions and their bound values of one sort-key range scan, in the order the SQL text names them. */
+function rangeScanConditions(opts: RangeScanBounds): { conds: string[]; params: unknown[] } {
+	const conds: string[] = ["hk = ?"];
+	const params: unknown[] = [opts.hk];
+
+	if (opts.direction === "asc") {
+		// Near-bound (start): cursor wins; else use lower bound.
+		if (opts.cursor) {
+			conds.push(opts.cursor.inclusive ? "sk >= ?" : "sk > ?");
+			params.push(opts.cursor.sk);
+		} else {
+			conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
+			params.push(opts.lower);
+		}
+		// Far-bound (end): upper.
+		if (opts.upper !== null) {
+			conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
+			params.push(opts.upper);
+		}
+	} else {
+		// Near-bound (start descending): cursor wins; else use upper bound.
+		if (opts.cursor) {
+			conds.push(opts.cursor.inclusive ? "sk <= ?" : "sk < ?");
+			params.push(opts.cursor.sk);
+		} else if (opts.upper !== null) {
+			conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
+			params.push(opts.upper);
+		}
+		// Far-bound (end descending): lower. Skip the condition when it's the zero-length
+		// sentinel with inclusive=true — that matches all keys and adds nothing to the query.
+		if (opts.lower.byteLength > 0 || !opts.lowerInclusive) {
+			conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
+			params.push(opts.lower);
+		}
+	}
+
+	return { conds, params };
+}
+
+/**
+ * The SQL of one queryItems leaf scan. The count selection reads only `sk` and `est_row_bytes` from the
+ * covering `idx_items_scan` index; the `INDEXED BY` pin is needed for the same reason as in
+ * `#storedEstRowBytes`. The projection selection reads the complete item with json decoded to text.
+ * `limit` binds as given.
+ */
+export function queryScanStatement(opts: RangeScanBounds & { limit: number; select: QuerySelect }): { sql: string; params: unknown[] } {
+	const { conds, params } = rangeScanConditions(opts);
+	const order = `ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`;
+	const sql =
+		opts.select === "count"
+			? `SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan WHERE ${conds.join(" AND ")} ${order}`
+			: `SELECT hk, sk, est_row_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
+	return { sql, params: [...params, opts.limit] };
 }
 
 // ---------------------------------------------------------------------------
@@ -920,39 +989,7 @@ export class PartitionStore {
 			last_transaction_ts: number;
 		};
 		const dataProjection = opts.decodeJson ? DATA_SELECT_DECODED : "data";
-		const conds: string[] = ["hk = ?"];
-		const params: unknown[] = [opts.hk];
-
-		if (opts.direction === "asc") {
-			// Near-bound (start): cursor wins; else use lower bound.
-			if (opts.cursor) {
-				conds.push(opts.cursor.inclusive ? "sk >= ?" : "sk > ?");
-				params.push(opts.cursor.sk);
-			} else {
-				conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
-				params.push(opts.lower);
-			}
-			// Far-bound (end): upper.
-			if (opts.upper !== null) {
-				conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
-				params.push(opts.upper);
-			}
-		} else {
-			// Near-bound (start descending): cursor wins; else use upper bound.
-			if (opts.cursor) {
-				conds.push(opts.cursor.inclusive ? "sk <= ?" : "sk < ?");
-				params.push(opts.cursor.sk);
-			} else if (opts.upper !== null) {
-				conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
-				params.push(opts.upper);
-			}
-			// Far-bound (end descending): lower. Skip the condition when it's the zero-length
-			// sentinel with inclusive=true — that matches all keys and adds nothing to the query.
-			if (opts.lower.byteLength > 0 || !opts.lowerInclusive) {
-				conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
-				params.push(opts.lower);
-			}
-		}
+		const { conds, params } = rangeScanConditions(opts);
 
 		const page = this.#storage.sql
 			.exec<Row>(
@@ -968,6 +1005,48 @@ export class PartitionStore {
 			data: fromSqlData(row.data),
 			kind: kindFromCode(data_kind),
 		}));
+	}
+
+	/**
+	 * Streams the rows of one queryItems leaf scan in scan order. The caller consumes `rows` synchronously
+	 * and can stop early; `sqlMetrics()` reports the physical reads of the statement up to that point.
+	 * Count rows carry `item: null`; projection rows carry the complete item.
+	 */
+	scanQueryPage(opts: RangeScanBounds & { limit: number; select: QuerySelect }): {
+		rows: Iterable<QueryScanRow>;
+		sqlMetrics: () => SqlMetrics;
+	} {
+		const { sql, params } = queryScanStatement(opts);
+		const cursor = this.#storage.sql.exec<{
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
+			est_row_bytes: number;
+			data: string | ArrayBuffer;
+			data_kind: number;
+			ttl_epoch_utc_seconds: number | null;
+			v: number;
+			last_transaction_ts: number;
+		}>(sql, ...params);
+		const select = opts.select;
+		function* rows(): Generator<QueryScanRow> {
+			for (const row of cursor) {
+				const sk = fromSqlKey(row.sk);
+				const item: MigratedItem | null =
+					select === "count"
+						? null
+						: {
+								hk: fromSqlKey(row.hk),
+								sk,
+								data: fromSqlData(row.data),
+								kind: kindFromCode(row.data_kind),
+								ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
+								v: row.v,
+								last_transaction_ts: row.last_transaction_ts,
+							};
+				yield { sk, estRowBytes: row.est_row_bytes, item };
+			}
+		}
+		return { rows: rows(), sqlMetrics: () => ({ rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten }) };
 	}
 
 	// ─── pending_transactions ───────────────────────────────────────────────

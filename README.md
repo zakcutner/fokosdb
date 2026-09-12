@@ -76,7 +76,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- queryItems: count only operation, filter + projections.
+- queryItems: filter + projections.
 - Add global eventual indexes (DynamoDB GSIs).
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Batch item operations (non-transactions).

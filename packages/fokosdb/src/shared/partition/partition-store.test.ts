@@ -5,7 +5,7 @@ import { PartitionDO } from "../../server/do-partition.js";
 import { compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
-import { PartitionStore } from "./partition-store.js";
+import { estimateItemBytes, PartitionStore, queryScanStatement, type ScanCursor } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
@@ -426,6 +426,187 @@ describe("PartitionStore - items", () => {
 			);
 			expect(plan(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`)).toContain("sqlite_autoindex_items_1");
 		});
+	});
+
+	it("scanQueryPage count rows carry the stored est_row_bytes and no item", async () => {
+		await withStore((store, state) => {
+			const hk = kb("hk");
+			const jsonText = JSON.stringify({ a: 1 });
+			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+
+			const storedEst = (sk: string) =>
+				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
+
+			const rows = [
+				...store.scanQueryPage({
+					hk,
+					lower: KeyCodec.encodeOptional(undefined),
+					lowerInclusive: true,
+					upper: null,
+					upperInclusive: false,
+					cursor: null,
+					direction: "asc",
+					limit: 100,
+					select: "count",
+				}).rows,
+			];
+			expect(rows.map((r) => KeyCodec.decode(r.sk))).toEqual(["b", "j", "t"]);
+			for (const r of rows) {
+				expect(r.item).toBeNull();
+				expect(r.estRowBytes).toBe(storedEst(KeyCodec.decode(r.sk) as string));
+			}
+			expect(rows[0].estRowBytes).toBe(expectedRowBytes(new Uint8Array([1, 2, 3]), hk, kb("b")));
+			expect(rows[2].estRowBytes).toBe(expectedRowBytes("hello", hk, kb("t")));
+		});
+	});
+
+	it("scanQueryPage projection rows carry the item and the same est_row_bytes", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			const jsonText = JSON.stringify({ a: 1 });
+			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+
+			const scan = (select: "count" | "projection") => [
+				...store.scanQueryPage({
+					hk,
+					lower: KeyCodec.encodeOptional(undefined),
+					lowerInclusive: true,
+					upper: null,
+					upperInclusive: false,
+					cursor: null,
+					direction: "asc",
+					limit: 100,
+					select,
+				}).rows,
+			];
+			const countRows = scan("count");
+			const projRows = scan("projection");
+
+			expect(projRows.map((r) => r.estRowBytes)).toEqual(countRows.map((r) => r.estRowBytes));
+			const items = new Map(projRows.map((r) => [KeyCodec.decode(r.sk) as string, r.item]));
+			expect(items.get("t")).toMatchObject({ data: "hello", kind: "text" });
+			expect(items.get("b")?.data).toEqual(new Uint8Array([1, 2, 3]));
+			// The public-read projection decodes JSONB back to JSON text.
+			expect(items.get("j")).toMatchObject({ data: jsonText, kind: "json" });
+		});
+	});
+
+	it.each(["asc", "desc"] as const)(
+		"scanQueryPage honors bounds, row cursors, and the sentinel sort key in %s order",
+		async (direction) => {
+			await withStore((store) => {
+				const hk = kb("hk");
+				const EMPTY = KeyCodec.encodeOptional(undefined);
+				for (const sk of [EMPTY, kb("a"), kb("b"), kb("c"), kb("d")]) {
+					store.upsertItem({ hk, sk, data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				}
+				const sksOf = (opts: {
+					lower?: KeyBytes;
+					lowerInclusive?: boolean;
+					upper?: KeyBytes | null;
+					upperInclusive?: boolean;
+					cursor?: ScanCursor | null;
+				}) =>
+					[
+						...store.scanQueryPage({
+							hk,
+							direction,
+							limit: 100,
+							select: "count",
+							lower: opts.lower ?? EMPTY,
+							lowerInclusive: opts.lowerInclusive ?? true,
+							upper: opts.upper ?? null,
+							upperInclusive: opts.upperInclusive ?? false,
+							cursor: opts.cursor ?? null,
+						}).rows,
+					].map((r) => (r.sk.byteLength === 0 ? "" : (KeyCodec.decode(r.sk) as string)));
+
+				if (direction === "asc") {
+					expect(sksOf({ lower: kb("b"), lowerInclusive: true, upper: kb("d"), upperInclusive: false })).toEqual(["b", "c"]);
+					expect(sksOf({ lower: kb("b"), lowerInclusive: false })).toEqual(["c", "d"]);
+					expect(sksOf({ cursor: { hk, sk: kb("b") } })).toEqual(["c", "d"]);
+					expect(sksOf({ cursor: { hk, sk: kb("b"), inclusive: true } })).toEqual(["b", "c", "d"]);
+					expect(sksOf({})).toEqual(["", "a", "b", "c", "d"]);
+				} else {
+					expect(sksOf({ lower: kb("b"), lowerInclusive: true, upper: kb("d"), upperInclusive: false })).toEqual(["c", "b"]);
+					expect(sksOf({ lower: kb("b"), lowerInclusive: false })).toEqual(["d", "c"]);
+					expect(sksOf({ cursor: { hk, sk: kb("b") } })).toEqual(["a", ""]);
+					expect(sksOf({ cursor: { hk, sk: kb("b"), inclusive: true } })).toEqual(["b", "a", ""]);
+					expect(sksOf({})).toEqual(["d", "c", "b", "a", ""]);
+				}
+			});
+		},
+	);
+
+	it("scanQueryPage binds limit as given and sqlMetrics reports the rows read so far", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			for (let i = 0; i < 10; i++) {
+				store.upsertItem({ hk, sk: kb(String(i).padStart(2, "0")), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			}
+			const bounds = {
+				hk,
+				lower: KeyCodec.encodeOptional(undefined),
+				lowerInclusive: true,
+				upper: null,
+				upperInclusive: false,
+				cursor: null,
+				direction: "asc" as const,
+			};
+
+			const limited = store.scanQueryPage({ ...bounds, limit: 3, select: "count" });
+			expect([...limited.rows]).toHaveLength(3);
+
+			const full = store.scanQueryPage({ ...bounds, limit: 10, select: "count" });
+			expect([...full.rows]).toHaveLength(10);
+			const fullReads = full.sqlMetrics().rowsRead;
+			expect(fullReads).toBeGreaterThanOrEqual(10);
+
+			// The consumer stops after one row; the statement reads no further.
+			const partial = store.scanQueryPage({ ...bounds, limit: 10, select: "count" });
+			partial.rows[Symbol.iterator]().next();
+			expect(partial.sqlMetrics().rowsRead).toBeGreaterThanOrEqual(1);
+			expect(partial.sqlMetrics().rowsRead).toBeLessThan(fullReads);
+		});
+	});
+
+	it("the count scan is index-only on idx_items_scan, and the projection scan is not", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string, ...params: unknown[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			const bounds = { hk: kb("hk"), lower: kb("a"), lowerInclusive: true, upper: kb("z"), upperInclusive: false };
+			for (const direction of ["asc", "desc"] as const) {
+				for (const cursor of [null, { hk: kb("hk"), sk: kb("m") }]) {
+					const { sql, params } = queryScanStatement({ ...bounds, direction, cursor, limit: 10, select: "count" });
+					expect(plan(sql, ...params)).toContain("COVERING INDEX idx_items_scan");
+				}
+			}
+
+			const proj = queryScanStatement({ ...bounds, direction: "asc", cursor: null, limit: 10, select: "projection" });
+			const projPlan = plan(proj.sql, ...proj.params);
+			expect(projPlan).not.toContain("COVERING INDEX");
+			expect(projPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+		});
+	});
+
+	it("estimateItemBytes grows with text, bytes, and JSON text payloads", () => {
+		const base = { hk: kb("hk"), sk: kb("sk"), kind: "text" as const, ttl_epoch_utc_seconds: null, v: 1, last_transaction_ts: 0 };
+		const expected = (data: string | Uint8Array) =>
+			kb("hk").byteLength + kb("sk").byteLength + (typeof data === "string" ? data.length * 2 : data.byteLength) + 8 + 64;
+		const jsonText = JSON.stringify({ a: 1 });
+		expect(estimateItemBytes({ ...base, data: "hello" })).toBe(expected("hello"));
+		expect(estimateItemBytes({ ...base, data: new Uint8Array([1, 2, 3]), kind: "bytes" })).toBe(expected(new Uint8Array([1, 2, 3])));
+		expect(estimateItemBytes({ ...base, data: jsonText, kind: "json" })).toBe(expected(jsonText));
+		expect(estimateItemBytes({ ...base, data: "x".repeat(100) })).toBeGreaterThan(estimateItemBytes({ ...base, data: "x" }));
 	});
 
 	it("migration reads json verbatim (raw JSONB) and re-inserts it queryable by jsonb_extract", async () => {

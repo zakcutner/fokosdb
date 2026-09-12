@@ -154,8 +154,9 @@ describe("clipToChildRange", () => {
 
 describe("isChildFullyBeforeCursor", () => {
 	describe("ascending", () => {
-		it("skips when child end equals cursor sk", () => {
+		it("skips when child end equals cursor sk, regardless of inclusivity", () => {
 			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("d") }, "asc")).toBe(true);
+			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("d"), inclusive: true }, "asc")).toBe(true);
 		});
 
 		it("skips when child end is below cursor sk", () => {
@@ -172,12 +173,18 @@ describe("isChildFullyBeforeCursor", () => {
 	});
 
 	describe("descending", () => {
-		it("skips when child start equals cursor sk", () => {
+		it("skips when child start equals an exclusive cursor sk", () => {
 			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("b") }, "desc")).toBe(true);
+			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("b"), inclusive: false }, "desc")).toBe(true);
 		});
 
-		it("skips when child start is above cursor sk", () => {
+		it("does not skip when child start equals an inclusive cursor sk", () => {
+			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("b"), inclusive: true }, "desc")).toBe(false);
+		});
+
+		it("skips when child start is above cursor sk, regardless of inclusivity", () => {
 			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("a") }, "desc")).toBe(true);
+			expect(isChildFullyBeforeCursor(kb("b"), kb("d"), { hk: kb("h"), sk: kb("a"), inclusive: true }, "desc")).toBe(true);
 		});
 
 		it("does not skip when child start is below cursor sk", () => {

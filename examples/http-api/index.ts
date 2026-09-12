@@ -198,8 +198,9 @@ const QueryItemsBodySchema = v.object({
 		v.object({ hashKey: v.string(), sortKeyCondition: v.optional(SortKeyConditionSchema), scanIndexForward: v.optional(v.boolean()) }),
 	),
 	limit: v.optional(PositiveIntSchema),
-	maxPageBytes: v.optional(PositiveIntSchema),
+	maxResponseBytes: v.optional(PositiveIntSchema),
 	cursor: v.optional(v.string()),
+	select: v.optional(v.union([v.literal("projection"), v.literal("count")])),
 	partitionOptions: PartitionOptionsSchema,
 });
 

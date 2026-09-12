@@ -195,6 +195,22 @@ jsonpath "$.items[5].hashKey" == "qi#desc"
 jsonpath "$.items[5].sortKey" == "s1"
 jsonpath "$.items[5].data" == "desc-1"
 
+# count the same two hash keys: no items on the wire, only the page counters
+POST {{base_url}}/api/rpc/{{database_name}}/queryItems
+Content-Type: application/json
+{
+  "queries": [
+    { "hashKey": "qi#asc", "scanIndexForward": true },
+    { "hashKey": "qi#desc", "scanIndexForward": false }
+  ],
+  "select": "count"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.count" == 6
+jsonpath "$.scannedCount" == 6
+jsonpath "$.items" count == 0
+
 # ── transactWriteItems ─────────────────────────────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems

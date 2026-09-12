@@ -83,7 +83,7 @@ export function decodeCursor(s: string): DecodedCursor {
 /**
  * Fingerprint over the request's identity-determining fields ONLY — the ordered sub-query list
  * (each hashKey + its normalized interval bounds/inclusivity + direction, with empty intervals
- * marked). Deliberately excludes limit/maxPageBytes/cursor, which may change between pages.
+ * marked). Deliberately excludes limit, maxResponseBytes, select, and cursor, which may change between pages.
  */
 export function computeCursorFingerprint(
 	queries: Array<{ hashKey: KeyBytes; interval: SkInterval | null; direction: "asc" | "desc" }>,

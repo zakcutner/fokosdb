@@ -1,43 +1,70 @@
 /**
  * Mutable budget tracker for a single queryItems page. Shared across sub-queries (FokosDB)
- * and across range-tree children (walkRangeChildren). The three counters are independent;
- * callers check `budgetExhausted` vs `visitsExhausted` separately because they produce
- * different cursor shapes (last-item cursor vs boundary cursor).
+ * and across range-tree children (walkRangeChildren). Four counters bound one page: evaluated
+ * items, evaluated bytes (the stored bytes of the evaluated candidates), response bytes (the
+ * materialized items), and leaf-partition visits. `allowOversizedFirstItem` lets the first
+ * materialized item of the page exceed the response budget, so one oversized item cannot stall
+ * the cursor. Callers check `budgetExhausted` vs `visitsExhausted` separately because they
+ * produce different cursor shapes (last-evaluated cursor vs boundary cursor).
  */
-export class PageBudget {
-	remainingBytes: number;
-	remainingLimit: number | null;
-	remainingVisits: number;
+export const DEFAULT_EVALUATED_ITEMS_PER_PAGE = 1_000;
+export const MAX_EVALUATED_ITEMS_PER_PAGE = 100_000;
+export const MAX_EVALUATED_BYTES_PER_PAGE = 100 * 1024 * 1024;
+export const DEFAULT_RESPONSE_BYTES_PER_PAGE = 3 * 1024 * 1024;
+export const MAX_RESPONSE_BYTES_PER_PAGE = 16 * 1024 * 1024;
+export const MAX_PARTITION_VISITS_PER_PAGE = 100;
 
-	constructor(budgetBytes: number, limit: number | null, maxVisits: number) {
-		this.remainingBytes = budgetBytes;
-		this.remainingLimit = limit;
-		this.remainingVisits = maxVisits;
+export type QueryPageBudgetState = {
+	remainingEvaluatedItems: number;
+	remainingEvaluatedBytes: number;
+	remainingResponseBytes: number;
+	remainingPartitionVisits: number;
+	allowOversizedFirstItem: boolean;
+};
+
+export class QueryPageBudget implements QueryPageBudgetState {
+	remainingEvaluatedItems: number;
+	remainingEvaluatedBytes: number;
+	remainingResponseBytes: number;
+	remainingPartitionVisits: number;
+	allowOversizedFirstItem: boolean;
+
+	constructor(init: QueryPageBudgetState) {
+		this.remainingEvaluatedItems = init.remainingEvaluatedItems;
+		this.remainingEvaluatedBytes = init.remainingEvaluatedBytes;
+		this.remainingResponseBytes = init.remainingResponseBytes;
+		this.remainingPartitionVisits = init.remainingPartitionVisits;
+		this.allowOversizedFirstItem = init.allowOversizedFirstItem;
 	}
 
-	consume(bytesConsumed: number, itemCount: number, partitionsVisited: number): void {
-		this.remainingBytes -= bytesConsumed;
-		if (this.remainingLimit !== null) this.remainingLimit -= itemCount;
-		this.remainingVisits -= partitionsVisited;
+	/** Applies one partition response to the page budget. */
+	consume(res: {
+		scannedCount: number;
+		evaluatedBytes: number;
+		responseBytes: number;
+		items: readonly unknown[];
+		partitionMetas: readonly unknown[];
+	}): void {
+		this.remainingEvaluatedItems -= res.scannedCount;
+		this.remainingEvaluatedBytes -= res.evaluatedBytes;
+		this.remainingResponseBytes -= res.responseBytes;
+		this.remainingPartitionVisits -= res.partitionMetas.length;
+		if (res.items.length > 0) this.allowOversizedFirstItem = false;
 	}
 
 	/**
-	 * Byte budget or item-count cap is exhausted.
-	 *
-	 * The null check is intentional, NOT redundant: `null <= 0` is `true` in JS (relational
-	 * comparison coerces null to 0), so a bare `this.remainingLimit <= 0` would report an unlimited
-	 * query as exhausted before it read a single item.
+	 * The evaluated-item, evaluated-byte, or response-byte budget is exhausted. These stop the
+	 * page at the last evaluated candidate.
 	 */
 	get budgetExhausted(): boolean {
-		return this.remainingBytes <= 0 || (this.remainingLimit !== null && this.remainingLimit <= 0);
+		return this.remainingEvaluatedItems <= 0 || this.remainingEvaluatedBytes <= 0 || this.remainingResponseBytes <= 0;
 	}
 
-	/** Leaf-partition visit cap is exhausted. */
+	/** The leaf-partition visit budget is exhausted. This stops the page at a child boundary. */
 	get visitsExhausted(): boolean {
-		return this.remainingVisits <= 0;
+		return this.remainingPartitionVisits <= 0;
 	}
 
-	/** Any of the three budgets is exhausted. */
 	get exhausted(): boolean {
 		return this.budgetExhausted || this.visitsExhausted;
 	}

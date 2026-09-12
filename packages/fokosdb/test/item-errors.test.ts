@@ -49,7 +49,12 @@ describe("the validation codes of the item operations", () => {
 		],
 		["no queries", () => db.queryItems({ queries: [] }), "query_queries_empty"],
 		["a query limit of zero", () => db.queryItems({ queries: [{ hashKey: "h" }], limit: 0 }), "query_limit_invalid"],
-		["a negative maxPageBytes", () => db.queryItems({ queries: [{ hashKey: "h" }], maxPageBytes: -1 }), "query_max_page_bytes_invalid"],
+		[
+			"a negative maxResponseBytes",
+			() => db.queryItems({ queries: [{ hashKey: "h" }], maxResponseBytes: -1 }),
+			"query_max_response_bytes_invalid",
+		],
+		["an unknown select", () => db.queryItems({ queries: [{ hashKey: "h" }], select: "all" as "count" }), "query_select_invalid"],
 		[
 			"an empty sort-key bound",
 			() => db.queryItems({ queries: [{ hashKey: "h", sortKeyCondition: { op: "eq", value: "" } }] }),

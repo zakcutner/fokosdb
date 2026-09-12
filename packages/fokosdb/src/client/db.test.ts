@@ -3,6 +3,15 @@ import { StaticShardedDO } from "durable-utils/do-sharding";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import { PartitionDO } from "../server/do-partition.js";
+import {
+	DEFAULT_EVALUATED_ITEMS_PER_PAGE,
+	DEFAULT_RESPONSE_BYTES_PER_PAGE,
+	MAX_EVALUATED_BYTES_PER_PAGE,
+	MAX_EVALUATED_ITEMS_PER_PAGE,
+	MAX_PARTITION_VISITS_PER_PAGE,
+	MAX_RESPONSE_BYTES_PER_PAGE,
+} from "../shared/query/page-budget.js";
 import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
@@ -122,10 +131,25 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			// alice's group (sorted) precedes bob's group (sorted) — list order across groups, sk order within.
 			expect(sksOf(res)).toEqual(["a1", "a2", "a3", "b1", "b2"]);
 			expect(res.count).toBe(5);
+			expect(res.scannedCount).toBe(5);
 			expect(res.cursor).toBeUndefined();
 			// One leaf scan per sub-query (both route to the same single root DO, listed once per RPC).
 			expect(res.partitionMetas).toHaveLength(2);
 			expect(res.meta.rowsReturned).toBe(5);
+		});
+
+		it("count selection returns the page count with no items", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["b1", "b2"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+
+			const res = await db.queryItems({ queries: [{ hashKey: "alice" }, { hashKey: "bob" }], select: "count" });
+
+			expect(res.items).toEqual([]);
+			expect(res.count).toBe(5);
+			expect(res.scannedCount).toBe(5);
+			expect(res.meta.rowsReturned).toBe(5);
+			expect(res.cursor).toBeUndefined();
 		});
 
 		it("reverses both the group contents and applies sk DESC within each group", async () => {
@@ -228,7 +252,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			let cursor: string | undefined;
 			let pages = 0;
 			for (;;) {
-				const res = await db.queryItems({ queries, maxPageBytes: 25 * 1024, cursor });
+				const res = await db.queryItems({ queries, maxResponseBytes: 25 * 1024, cursor });
 				got.push(...sksOf(res));
 				pages++;
 				if (res.cursor === undefined) break;
@@ -277,6 +301,104 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("errors on an empty queries list", async () => {
 			const db = makeDB();
 			await expect(db.queryItems({ queries: [] })).rejects.toThrow(fokosErrorWith("query_queries_empty"));
+		});
+
+		it("resolves the page budgets from the constants", async () => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "alice", sortKey: "a1", data: "x" });
+
+			const spy = vi.spyOn(PartitionDO.prototype, "apiQueryItems");
+			try {
+				await db.queryItems({ queries: [{ hashKey: "alice" }] });
+				const defaults = spy.mock.calls.at(-1)![1];
+				expect(defaults.remainingEvaluatedItems).toBe(DEFAULT_EVALUATED_ITEMS_PER_PAGE);
+				expect(defaults.remainingEvaluatedBytes).toBe(MAX_EVALUATED_BYTES_PER_PAGE);
+				expect(defaults.remainingResponseBytes).toBe(DEFAULT_RESPONSE_BYTES_PER_PAGE);
+				expect(defaults.remainingPartitionVisits).toBe(MAX_PARTITION_VISITS_PER_PAGE);
+				expect(defaults.allowOversizedFirstItem).toBe(true);
+				expect(defaults.select).toBe("projection");
+
+				await db.queryItems({ queries: [{ hashKey: "alice" }], limit: 10 ** 9, maxResponseBytes: 10 ** 12, select: "count" });
+				const clamped = spy.mock.calls.at(-1)![1];
+				expect(clamped.remainingEvaluatedItems).toBe(MAX_EVALUATED_ITEMS_PER_PAGE);
+				expect(clamped.remainingResponseBytes).toBe(MAX_RESPONSE_BYTES_PER_PAGE);
+				expect(clamped.select).toBe("count");
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		it("explicit projection selection returns the same page as the default", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+
+			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], select: "projection" });
+			expect(sksOf(res)).toEqual(["a1", "a2", "a3"]);
+			expect(res.count).toBe(3);
+			expect(res.scannedCount).toBe(3);
+		});
+
+		it("count selection spans multiple, duplicate, and empty sub-queries", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["b1", "b2"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["s1", "s2", "s3", "s4"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+
+			const res = await db.queryItems({
+				queries: [
+					{ hashKey: "alice" },
+					{ hashKey: "zzz", sortKeyCondition: { op: "between", lower: "z9", upper: "z1" } }, // empty interval
+					{ hashKey: "k", sortKeyCondition: { op: "lte", value: "s2" } },
+					{ hashKey: "k", sortKeyCondition: { op: "gte", value: "s2" } },
+					{ hashKey: "bob" },
+				],
+				select: "count",
+			});
+
+			expect(res.items).toEqual([]);
+			// 3 + 0 + 2 + 3 + 2: the duplicate "s2" counts once per sub-query.
+			expect(res.count).toBe(10);
+			expect(res.scannedCount).toBe(10);
+			expect(res.cursor).toBeUndefined();
+			// The empty interval makes no RPC.
+			expect(res.partitionMetas).toHaveLength(4);
+		});
+
+		it("the first-item exception applies once per page across sub-queries", async () => {
+			const db = makeDB();
+			const big = "x".repeat(20 * 1024);
+			await db.putItem({ hashKey: "alice", sortKey: "a1", data: big });
+			await db.putItem({ hashKey: "bob", sortKey: "b1", data: big });
+
+			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
+			const p1 = await db.queryItems({ queries, maxResponseBytes: 1 });
+			expect(sksOf(p1)).toEqual(["a1"]);
+			expect(p1.cursor).toBeDefined();
+
+			const p2 = await db.queryItems({ queries, maxResponseBytes: 1, cursor: p1.cursor });
+			expect(sksOf(p2)).toEqual(["b1"]);
+			expect(p2.cursor).toBeUndefined();
+		});
+
+		it("count mode follows the same cursor as projection mode", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+
+			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
+			let count = 0;
+			let cursor: string | undefined;
+			let pages = 0;
+			for (;;) {
+				const res = await db.queryItems({ queries, limit: 2, select: "count", cursor });
+				count += res.count;
+				pages++;
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+				expect(pages).toBeLessThan(50);
+			}
+			expect(count).toBe(6);
+			expect(pages).toBeGreaterThan(1);
 		});
 	});
 

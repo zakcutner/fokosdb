@@ -42,6 +42,45 @@ describe("http-api example worker", () => {
 		});
 	});
 
+	it("queryItems returns the items of a projection page", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const sk of ["s1", "s2", "s3"]) {
+			const put = await rpc(table, "putItem", { hashKey: "qi", sortKey: sk, data: `v-${sk}` });
+			expect(put.status).toBe(200);
+		}
+
+		const res = await rpc(table, "queryItems", { queries: [{ hashKey: "qi" }], select: "projection" });
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { items: Array<Record<string, unknown>>; count: number; scannedCount: number };
+		expect(body.items).toHaveLength(3);
+		expect(body.count).toBe(3);
+		expect(body.scannedCount).toBe(3);
+		expect(body.items[0]).toMatchObject({ sortKey: "s1", data: "v-s1", dataEncoding: "utf8" });
+	});
+
+	it("queryItems returns a count page with no items", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const sk of ["s1", "s2", "s3"]) {
+			const put = await rpc(table, "putItem", { hashKey: "qi", sortKey: sk, data: `v-${sk}` });
+			expect(put.status).toBe(200);
+		}
+
+		const res = await rpc(table, "queryItems", { queries: [{ hashKey: "qi" }], select: "count" });
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			items: unknown[];
+			count: number;
+			scannedCount: number;
+			cursor?: string;
+			meta: { rowsReturned: number };
+		};
+		expect(body.items).toEqual([]);
+		expect(body.count).toBe(3);
+		expect(body.scannedCount).toBe(3);
+		expect(body.cursor).toBeUndefined();
+		expect(body.meta.rowsReturned).toBe(3);
+	});
+
 	it("reports a validation failure as 400", async () => {
 		const res = await rpc(`t-${crypto.randomUUID()}`, "putItem", { hashKey: 42 });
 		expect(res.status).toBe(400);
